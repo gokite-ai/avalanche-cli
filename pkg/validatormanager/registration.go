@@ -534,6 +534,10 @@ func InitValidatorRegistration(
 				}
 				opt.Logger.Info(logging.LightBlue.Wrap("The validator registration was already initialized. Proceeding to the next step"))
 				alreadyInitialized = true
+			} else if opt.BuildOnly {
+				// Return unsigned transaction for external signing (multi-sig)
+				ux.Logger.PrintToUser("%s", fmt.Sprintf("Validator staked amount: %s", utils.FormatAmount(stakeAmount, 18)))
+				return nil, ids.Empty, tx, nil
 			} else {
 				opt.Logger.Info(fmt.Sprintf("Validator registration initialized. InitiateTxHash: %s", tx.Hash()))
 			}

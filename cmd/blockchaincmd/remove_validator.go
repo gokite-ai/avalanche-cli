@@ -72,7 +72,9 @@ these prompts by providing the values with flags.`,
 	cmd.Flags().Uint64Var(&uptimeSec, "uptime", 0, "validator's uptime in seconds. If not provided, it will be automatically calculated")
 	cmd.Flags().BoolVar(&force, "force", false, "force validator removal even if it's not getting rewarded")
 	cmd.Flags().BoolVar(&externalValidatorManagerOwner, "external-evm-signature", false, "set this value to true when signing validator manager tx outside of cli (for multisig or ledger)")
-	cmd.Flags().StringVar(&validatorManagerOwner, "validator-manager-owner", "", "force using this address to issue transactions to the validator manager")
+	cmd.Flags().StringVar(&validatorManagerOwner, "validator-owner", "", "EVM address of the validator owner (for PoS validators: the staker address)")
+	cmd.Flags().StringVar(&validatorManagerOwner, "validator-manager-owner", "", "deprecated: use --validator-owner instead")
+	cmd.Flags().MarkHidden("validator-manager-owner")
 	cmd.Flags().StringVar(&initiateTxHash, "initiate-tx-hash", "", "initiate tx is already issued, with the given hash")
 	cmd.SetHelpFunc(flags.WithGroupedHelp([]flags.GroupedFlags{sigAggGroup}))
 	stakerPrivateKeyFlags.SetFlagNames("staker-private-key", "staker-key", "staker-genesis-key")
@@ -283,8 +285,42 @@ func removeValidatorSOV(
 		return err
 	}
 
+	// Get validator manager info early to check validator type
+	validatorManagerRPCEndpoint := sc.Networks[network.Name()].ValidatorManagerRPCEndpoint
+	validatorManagerAddress := sc.Networks[network.Name()].ValidatorManagerAddress
+	specializedValidatorManagerAddress := sc.Networks[network.Name()].SpecializedValidatorManagerAddress
+	if specializedValidatorManagerAddress != "" {
+		validatorManagerAddress = specializedValidatorManagerAddress
+	}
+
+	// Check if the validator to be removed is actually a PoS or PoA validator
+	// by looking at its MinStakeDuration. This is needed to determine the correct signer.
+	isValidatorPoS := false
+	if validatorManagerRPCEndpoint != "" && validatorManagerAddress != "" {
+		validationID, err := validatormanagersdk.GetValidationID(
+			validatorManagerRPCEndpoint,
+			common.HexToAddress(validatorManagerAddress),
+			nodeID,
+		)
+		if err == nil && validationID != ids.Empty {
+			stakingInfo, err := validatormanagersdk.GetStakingValidator(
+				validatorManagerRPCEndpoint,
+				common.HexToAddress(validatorManagerAddress),
+				validationID,
+			)
+			if err == nil {
+				isValidatorPoS = stakingInfo.MinStakeDuration != 0
+				ux.Logger.PrintToUser("DEBUG: Validator MinStakeDuration: %d, isValidatorPoS: %v", stakingInfo.MinStakeDuration, isValidatorPoS)
+			}
+		}
+	}
+
 	var signer *evm.Signer
-	if sc.PoS() {
+	// Determine signer based on actual validator type, not just manager type
+	// PoA validators can be removed by anyone (permissionless) when manager is PoS
+	// PoS validators can only be removed by their owner
+	if sc.PoS() && isValidatorPoS {
+		// This is a true PoS validator - need the staker's private key
 		genesisAddress, genesisPrivateKey, err := contract.GetEVMSubnetPrefundedKey(
 			app,
 			network,
@@ -315,7 +351,45 @@ func removeValidatorSOV(
 		if err != nil {
 			return err
 		}
+	} else if sc.PoS() && !isValidatorPoS {
+		// This is a PoA validator being removed via PoS StakingManager
+		// PoA validators can be removed by anyone (permissionless), just need a key to pay gas
+		ux.Logger.PrintToUser("%s", logging.Yellow.Wrap("This is a PoA validator. Removal is permissionless - any key can be used to pay gas fees."))
+		if externalValidatorManagerOwner {
+			signer, err = evm.NewNoOpSigner(common.HexToAddress(validatorManagerOwner))
+			if err != nil {
+				return err
+			}
+		} else {
+			// Try to find validator manager owner key, or use any available key
+			ownerPrivateKeyFound, _, _, privateKey, err := contract.SearchForManagedKey(
+				app,
+				network,
+				common.HexToAddress(validatorManagerOwner),
+				false, // don't require exact match for PoA removal
+			)
+			if err != nil {
+				return err
+			}
+			if !ownerPrivateKeyFound {
+				// For PoA validators, we can use the genesis key or prompt for any key
+				_, genesisPrivateKey, err := contract.GetEVMSubnetPrefundedKey(
+					app,
+					network,
+					chainSpec,
+				)
+				if err != nil {
+					return err
+				}
+				privateKey = genesisPrivateKey
+			}
+			signer, err = evm.NewSignerFromPrivateKey(privateKey)
+			if err != nil {
+				return err
+			}
+		}
 	} else {
+		// Pure PoA mode - ValidatorManager owner is still PoAManager
 		if externalValidatorManagerOwner {
 			signer, err = evm.NewNoOpSigner(common.HexToAddress(validatorManagerOwner))
 			if err != nil {
@@ -351,10 +425,11 @@ func removeValidatorSOV(
 		return fmt.Errorf("unable to find Validator Manager address")
 	}
 
-	validatorManagerRPCEndpoint := sc.Networks[network.Name()].ValidatorManagerRPCEndpoint
+	// These variables were already declared earlier in the function
+	validatorManagerRPCEndpoint = sc.Networks[network.Name()].ValidatorManagerRPCEndpoint
 	validatorManagerBlockchainID := sc.Networks[network.Name()].ValidatorManagerBlockchainID
-	validatorManagerAddress := sc.Networks[network.Name()].ValidatorManagerAddress
-	specializedValidatorManagerAddress := sc.Networks[network.Name()].SpecializedValidatorManagerAddress
+	validatorManagerAddress = sc.Networks[network.Name()].ValidatorManagerAddress
+	specializedValidatorManagerAddress = sc.Networks[network.Name()].SpecializedValidatorManagerAddress
 	if specializedValidatorManagerAddress != "" {
 		validatorManagerAddress = specializedValidatorManagerAddress
 	}

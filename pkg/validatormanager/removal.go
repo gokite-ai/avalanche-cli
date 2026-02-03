@@ -106,6 +106,8 @@ func InitializeValidatorRemoval(
 		validatormanager.ErrorSignatureToError,
 		"initiateValidatorRemoval(bytes32)",
 		validationID,
+		false, // no uptime proof for PoA validator
+		uint32(0),
 	)
 }
 
@@ -254,6 +256,7 @@ func InitValidatorRemoval(
 			if err != nil {
 				return nil, ids.Empty, nil, evm.TransactionError(nil, err, "failure getting uptime proof")
 			}
+			logger.Info(fmt.Sprintf("signed uptime proof: %s", signedUptimeProof.String()))
 		}
 		var tx *types.Transaction
 		tx, receipt, err = InitializeValidatorRemoval(

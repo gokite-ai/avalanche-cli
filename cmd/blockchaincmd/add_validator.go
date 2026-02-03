@@ -120,7 +120,9 @@ Testnet or Mainnet.`,
 	cmd.Flags().BoolVar(&partialSync, "partial-sync", true, "set primary network partial sync for new validators")
 	cmd.Flags().StringVar(&nodeEndpoint, "node-endpoint", "", "gather node id/bls from publicly available avalanchego apis on the given endpoint")
 	cmd.Flags().Uint64Var(&weight, validatorWeightFlag, uint64(constants.DefaultStakeWeight), "set the weight of the validator")
-	cmd.Flags().StringVar(&validatorManagerOwner, "validator-manager-owner", "", "force using this address to issue transactions to the validator manager")
+	cmd.Flags().StringVar(&validatorManagerOwner, "validator-owner", "", "EVM address that will be the owner of this validator (for PoS: the staker address)")
+	cmd.Flags().StringVar(&validatorManagerOwner, "validator-manager-owner", "", "deprecated: use --validator-owner instead")
+	cmd.Flags().MarkHidden("validator-manager-owner")
 	stakerPrivateKeyFlags.SetFlagNames("staker-private-key", "staker-key", "staker-genesis-key")
 	stakerPrivateKeyFlags.AddToCmd(cmd, "as source of staking funds")
 
@@ -225,20 +227,25 @@ func addValidator(cmd *cobra.Command, args []string) error {
 		clusterNameFlagValue = sc.Networks[network.Name()].ClusterName
 	}
 
-	// TODO: will estimate fee in subsecuent PR
-	fee := uint64(0)
-	kc, err := keychain.GetKeychainFromCmdLineFlags(
-		app,
-		"to pay for transaction fees on P-Chain",
-		network,
-		keyName,
-		useEwoq,
-		useLedger,
-		ledgerAddresses,
-		fee,
-	)
-	if err != nil {
-		return err
+	// For external signing mode (first step - generating calldata only),
+	// skip P-Chain keychain acquisition as we don't need it yet
+	var kc *keychain.Keychain
+	if !externalValidatorManagerOwner || initiateTxHash != "" {
+		// TODO: will estimate fee in subsecuent PR
+		fee := uint64(0)
+		kc, err = keychain.GetKeychainFromCmdLineFlags(
+			app,
+			"to pay for transaction fees on P-Chain",
+			network,
+			keyName,
+			useEwoq,
+			useLedger,
+			ledgerAddresses,
+			fee,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	sovereign := sc.Sovereign
@@ -346,14 +353,18 @@ func addValidator(cmd *cobra.Command, args []string) error {
 
 	network.HandlePublicNetworkSimulation()
 
+	// For external signing mode (first step), skip deployer creation as kc may be nil
+	var deployer *subnet.PublicDeployer
 	if !sovereign {
 		if err := UpdateKeychainWithSubnetControlKeys(kc, network, blockchainName); err != nil {
 			return err
 		}
-	}
-	deployer := subnet.NewPublicDeployer(kc, network)
-	if !sovereign {
+		deployer = subnet.NewPublicDeployer(kc, network)
 		return CallAddValidatorNonSOV(deployer, network, kc, useLedger, blockchainName, nodeIDStr, defaultValidatorParams, waitForTxAcceptance)
+	}
+	// Create deployer only when needed (not in first step of external signing)
+	if kc != nil {
+		deployer = subnet.NewPublicDeployer(kc, network)
 	}
 	if err := CallAddValidator(
 		deployer,
@@ -453,44 +464,81 @@ func CallAddValidator(
 	var signer *evm.Signer
 
 	if pos {
-		stakeAmount, err := validatormanager.PoSWeightToValue(
-			validatorManagerRPCEndpoint,
-			common.HexToAddress(validatorManagerAddress),
-			weight,
-		)
-		if err != nil {
-			return fmt.Errorf("failure obtaining value from weight: %w", err)
-		}
-		genesisAddress, genesisPrivateKey, err := contract.GetEVMSubnetPrefundedKey(
-			app,
-			network,
-			chainSpec,
-		)
-		if err != nil {
-			return err
-		}
-		privateKey, err := stakerPrivateKeyFlags.GetPrivateKey(app, genesisPrivateKey)
-		if err != nil {
-			return err
-		}
-		if privateKey == "" {
-			ux.Logger.PrintToUser("%s", logging.Yellow.Wrap("A key is needed to provide the staking funds and pay the validator manager fees"))
-			ux.Logger.PrintToUser("Staking funds: %s tokens", utils.FormatAmount(stakeAmount, 18))
-			privateKey, err = prompts.PromptPrivateKey(
+		// For PoS mode, check if external signing is requested (for multi-sig staker/owner)
+		if externalValidatorManagerOwner {
+			// Multi-sig staker scenario: use NoOpSigner to generate calldata
+			// validatorManagerOwner should be the multi-sig address that will stake
+			if validatorManagerOwner == "" {
+			validatorManagerOwner, err = prompts.PromptAddress(
 				app.Prompt,
-				"provide the staking funds",
+				"be the owner of this validator (for multi-sig: the Safe address)",
 				app.GetKeyDir(),
 				app.GetKey,
-				genesisAddress,
-				genesisPrivateKey,
+				"",
+				network,
+				prompts.EVMFormat,
+				"Enter the validator owner address",
+			)
+				if err != nil {
+					return err
+				}
+			}
+			signer, err = evm.NewNoOpSigner(common.HexToAddress(validatorManagerOwner))
+			if err != nil {
+				return err
+			}
+			stakeAmount, err := validatormanager.PoSWeightToValue(
+				validatorManagerRPCEndpoint,
+				common.HexToAddress(validatorManagerAddress),
+				weight,
+			)
+			if err != nil {
+				return fmt.Errorf("failure obtaining value from weight: %w", err)
+			}
+		ux.Logger.PrintToUser("%s", logging.Yellow.Wrap("External signing mode enabled for PoS validator owner"))
+		ux.Logger.PrintToUser("Validator owner (staker): %s", validatorManagerOwner)
+			ux.Logger.PrintToUser("Required staking funds: %s tokens", utils.FormatAmount(stakeAmount, 18))
+		} else {
+			// Regular PoS mode: require private key
+			stakeAmount, err := validatormanager.PoSWeightToValue(
+				validatorManagerRPCEndpoint,
+				common.HexToAddress(validatorManagerAddress),
+				weight,
+			)
+			if err != nil {
+				return fmt.Errorf("failure obtaining value from weight: %w", err)
+			}
+			genesisAddress, genesisPrivateKey, err := contract.GetEVMSubnetPrefundedKey(
+				app,
+				network,
+				chainSpec,
 			)
 			if err != nil {
 				return err
 			}
-		}
-		signer, err = evm.NewSignerFromPrivateKey(privateKey)
-		if err != nil {
-			return err
+			privateKey, err := stakerPrivateKeyFlags.GetPrivateKey(app, genesisPrivateKey)
+			if err != nil {
+				return err
+			}
+			if privateKey == "" {
+				ux.Logger.PrintToUser("%s", logging.Yellow.Wrap("A key is needed to provide the staking funds and pay the validator manager fees"))
+				ux.Logger.PrintToUser("Staking funds: %s tokens", utils.FormatAmount(stakeAmount, 18))
+				privateKey, err = prompts.PromptPrivateKey(
+					app.Prompt,
+					"provide the staking funds",
+					app.GetKeyDir(),
+					app.GetKey,
+					genesisAddress,
+					genesisPrivateKey,
+				)
+				if err != nil {
+					return err
+				}
+			}
+			signer, err = evm.NewSignerFromPrivateKey(privateKey)
+			if err != nil {
+				return err
+			}
 		}
 	} else {
 		if externalValidatorManagerOwner {
@@ -509,7 +557,7 @@ func CallAddValidator(
 				return err
 			}
 			if !ownerPrivateKeyFound {
-				return fmt.Errorf("private key for Validator manager owner %s is not found", validatorManagerOwner)
+				return fmt.Errorf("private key for validator owner %s is not found", validatorManagerOwner)
 			}
 			signer, err = evm.NewSignerFromPrivateKey(privateKey)
 			if err != nil {
@@ -551,21 +599,33 @@ func CallAddValidator(
 
 	ux.Logger.PrintToUser(logging.Yellow.Wrap("RPC Endpoint: %s"), validatorManagerRPCEndpoint)
 
-	if balanceAVAX == 0 {
-		availableBalance, err := utils.GetNetworkBalance(kc.Addresses().List(), network.Endpoint)
-		if err != nil {
-			return err
+	// For external signing mode (first step - generating calldata only),
+	// skip P-Chain balance check as we don't need it yet
+	var balance uint64
+	if externalValidatorManagerOwner && initiateTxHash == "" {
+		// First step: just generating calldata, use a placeholder balance
+		// The actual balance will be set when completing registration
+		balance = uint64(0.5 * float64(units.Avax)) // default 0.5 AVAX
+		if balanceAVAX > 0 {
+			balance = uint64(balanceAVAX * float64(units.Avax))
 		}
-		if availableBalance == 0 {
-			return fmt.Errorf("chosen key has zero balance")
+	} else {
+		if balanceAVAX == 0 {
+			availableBalance, err := utils.GetNetworkBalance(kc.Addresses().List(), network.Endpoint)
+			if err != nil {
+				return err
+			}
+			if availableBalance == 0 {
+				return fmt.Errorf("chosen key has zero balance")
+			}
+			balanceAVAX, err = promptValidatorBalanceAVAX(float64(availableBalance) / float64(units.Avax))
+			if err != nil {
+				return err
+			}
 		}
-		balanceAVAX, err = promptValidatorBalanceAVAX(float64(availableBalance) / float64(units.Avax))
-		if err != nil {
-			return err
-		}
+		// convert to nanoAVAX
+		balance = uint64(balanceAVAX * float64(units.Avax))
 	}
-	// convert to nanoAVAX
-	balance := uint64(balanceAVAX * float64(units.Avax))
 
 	if remainingBalanceOwnerAddr == "" {
 		remainingBalanceOwnerAddr, err = blockchain.GetKeyForChangeOwner(app, network)
@@ -629,22 +689,28 @@ func CallAddValidator(
 	}
 
 	// Get P-Chain's current epoch for RegisterL1ValidatorMessage (signed by L1, verified by P-Chain)
+	// Skip P-Chain operations when just generating calldata (first step of external signing)
 	pChainEpoch, err := sdkutils.GetCurrentEpoch(network.Endpoint, "P")
 	if err != nil {
-		return fmt.Errorf("failure getting p-chain current epoch: %w", err)
+		// If we're just generating calldata, we can skip P-Chain epoch operations
+		if !(externalValidatorManagerOwner && initiateTxHash == "") {
+			return fmt.Errorf("failure getting p-chain current epoch: %w", err)
+		}
 	}
-	epochTime := time.Unix(pChainEpoch.StartTime, 0)
-	elapsed := time.Since(epochTime)
-	if elapsed < constants.ProposerVMEpochDuration {
-		time.Sleep(constants.ProposerVMEpochDuration - elapsed)
-	}
-	_, _, err = deployer.PChainTransfer(kc.Addresses().List()[0], 1)
-	if err != nil {
-		return fmt.Errorf("could not sent dummy transfer on p-chain: %w", err)
-	}
-	pChainEpoch, err = sdkutils.GetCurrentEpoch(network.Endpoint, "P")
-	if err != nil {
-		return fmt.Errorf("failure getting p-chain current epoch: %w", err)
+	if !(externalValidatorManagerOwner && initiateTxHash == "") {
+		epochTime := time.Unix(pChainEpoch.StartTime, 0)
+		elapsed := time.Since(epochTime)
+		if elapsed < constants.ProposerVMEpochDuration {
+			time.Sleep(constants.ProposerVMEpochDuration - elapsed)
+		}
+		_, _, err = deployer.PChainTransfer(kc.Addresses().List()[0], 1)
+		if err != nil {
+			return fmt.Errorf("could not sent dummy transfer on p-chain: %w", err)
+		}
+		pChainEpoch, err = sdkutils.GetCurrentEpoch(network.Endpoint, "P")
+		if err != nil {
+			return fmt.Errorf("failure getting p-chain current epoch: %w", err)
+		}
 	}
 
 	ctx, cancel := sdkutils.GetTimedContext(constants.EVMEventLookupTimeout)
@@ -762,17 +828,39 @@ func CallAddValidator(
 	if err != nil {
 		return fmt.Errorf("failure getting l1 current epoch: %w", err)
 	}
-	epochTime = time.Unix(l1Epoch.StartTime, 0)
-	elapsed = time.Since(epochTime)
-	if elapsed < constants.ProposerVMEpochDuration {
-		time.Sleep(constants.ProposerVMEpochDuration - elapsed)
+	l1EpochTime := time.Unix(l1Epoch.StartTime, 0)
+	l1Elapsed := time.Since(l1EpochTime)
+	if l1Elapsed < constants.ProposerVMEpochDuration {
+		time.Sleep(constants.ProposerVMEpochDuration - l1Elapsed)
 	}
 	client, err := evm.GetClient(validatorManagerRPCEndpoint)
 	if err != nil {
 		return fmt.Errorf("failure connecting to validator manager L1: %w", err)
 	}
-	if err := client.SetupProposerVM(signer); err != nil {
-		return fmt.Errorf("failure setting proposer VM on L1: %w", err)
+	// SetupProposerVM requires sending a transaction to advance the block timestamp.
+	// For external signing (multi-sig), we try to use genesis key if available,
+	// otherwise skip and let the user handle it manually.
+	if externalValidatorManagerOwner {
+		// Try to use genesis key for SetupProposerVM
+		_, genesisPrivateKey, err := contract.GetEVMSubnetPrefundedKey(
+			app,
+			network,
+			chainSpec,
+		)
+		if err == nil && genesisPrivateKey != "" {
+			genesisSigner, err := evm.NewSignerFromPrivateKey(genesisPrivateKey)
+			if err == nil {
+				if err := client.SetupProposerVM(genesisSigner); err != nil {
+					ux.Logger.PrintToUser("%s", logging.Yellow.Wrap("Warning: Could not advance block timestamp automatically. You may need to send a transaction to the L1 before completing registration."))
+				}
+			}
+		} else {
+			ux.Logger.PrintToUser("%s", logging.Yellow.Wrap("Warning: External signing mode - skipping automatic block timestamp advancement. Ensure a recent block exists on the L1."))
+		}
+	} else {
+		if err := client.SetupProposerVM(signer); err != nil {
+			return fmt.Errorf("failure setting proposer VM on L1: %w", err)
+		}
 	}
 	l1Epoch, err = sdkutils.GetCurrentL1Epoch(validatorManagerRPCEndpoint, validatorManagerBlockchainID.String())
 	if err != nil {
