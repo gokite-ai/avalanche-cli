@@ -95,7 +95,7 @@ func InitializeValidatorRemoval(
 			uint32(0),
 		)
 	}
-	// PoA case
+	// PoA case - same method signature, just with includeUptimeProof=false
 	return contractSDK.TxToMethod(
 		logger,
 		rpcURL,
@@ -104,7 +104,7 @@ func InitializeValidatorRemoval(
 		big.NewInt(0),
 		"POA validator removal initialization",
 		validatormanager.ErrorSignatureToError,
-		"initiateValidatorRemoval(bytes32)",
+		"initiateValidatorRemoval(bytes32,bool,uint32)",
 		validationID,
 		false, // no uptime proof for PoA validator
 		uint32(0),

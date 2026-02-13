@@ -360,6 +360,17 @@ func removeValidatorSOV(
 			if err != nil {
 				return err
 			}
+		} else if keyName != "" {
+			// Use the key provided via --key flag for EVM signer (to pay L1 gas fees)
+			k, err := app.GetKey(keyName, network, false)
+			if err != nil {
+				return fmt.Errorf("failed to load key %s: %w", keyName, err)
+			}
+			ux.Logger.PrintToUser("Using key %s (%s) for L1 gas fees", keyName, k.C())
+			signer, err = evm.NewSignerFromPrivateKey(k.PrivKeyHex())
+			if err != nil {
+				return err
+			}
 		} else {
 			// Try to find validator manager owner key, or use any available key
 			ownerPrivateKeyFound, _, _, privateKey, err := contract.SearchForManagedKey(
@@ -494,6 +505,8 @@ func removeValidatorSOV(
 	ctx, cancel := sdkutils.GetTimedContext(constants.EVMEventLookupTimeout)
 	defer cancel()
 	// try to remove the validator. If err is "delegator ineligible for rewards" confirm with user and force remove
+	// Use isValidatorPoS (actual validator type) not sc.PoS() (manager type)
+	// PoA validators don't need uptime proof even when manager is in PoS mode
 	signedMessage, validationID, rawTx, err := validatormanager.InitValidatorRemoval(
 		ctx,
 		duallogger.NewDualLogger(true, app),
@@ -506,7 +519,7 @@ func removeValidatorSOV(
 		signer,
 		nodeID,
 		aggregatorLogger,
-		sc.PoS(),
+		isValidatorPoS,
 		uptimeSec,
 		isBootstrapValidator || force,
 		validatorManagerBlockchainID,
@@ -538,7 +551,7 @@ func removeValidatorSOV(
 			signer,
 			nodeID,
 			aggregatorLogger,
-			sc.PoS(),
+			isValidatorPoS,
 			uptimeSec,
 			true, // force
 			validatorManagerBlockchainID,

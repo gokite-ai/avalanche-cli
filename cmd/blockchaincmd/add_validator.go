@@ -14,6 +14,7 @@ import (
 	"github.com/ava-labs/avalanche-cli/pkg/constants"
 	"github.com/ava-labs/avalanche-cli/pkg/contract"
 	"github.com/ava-labs/avalanche-cli/pkg/duallogger"
+	"github.com/ava-labs/avalanche-cli/pkg/key"
 	"github.com/ava-labs/avalanche-cli/pkg/keychain"
 	"github.com/ava-labs/avalanche-cli/pkg/localnet"
 	"github.com/ava-labs/avalanche-cli/pkg/models"
@@ -463,7 +464,51 @@ func CallAddValidator(
 
 	var signer *evm.Signer
 
-	if pos {
+	// If initiateTxHash is provided, first step (EVM initiate) is already done
+	// But we still need a signer for completeValidatorRegistration (permissionless, just pays gas)
+	if initiateTxHash != "" {
+		ux.Logger.PrintToUser("%s", logging.Yellow.Wrap("Initiate transaction already completed. Proceeding to P-Chain registration..."))
+		// Get a signer for complete operation - use staker key, genesis key, or the --key's private key
+		privateKey, err := stakerPrivateKeyFlags.GetPrivateKey(app, "")
+		if err != nil {
+			return err
+		}
+		if privateKey != "" {
+			signer, err = evm.NewSignerFromPrivateKey(privateKey)
+			if err != nil {
+				return err
+			}
+		} else {
+			// Try genesis key
+			genesisAddress, genesisPrivateKey, err := contract.GetEVMSubnetPrefundedKey(
+				app,
+				network,
+				chainSpec,
+			)
+			if err == nil && genesisPrivateKey != "" {
+				signer, err = evm.NewSignerFromPrivateKey(genesisPrivateKey)
+				if err != nil {
+					return err
+				}
+				ux.Logger.PrintToUser("Using genesis key (%s) for complete operation", genesisAddress)
+			} else if keyName != "" {
+				// Use the --key's private key for EVM signing
+				keyPath := app.GetKeyPath(keyName)
+				sk, err := key.LoadSoft(network.ID, keyPath)
+				if err != nil {
+					return fmt.Errorf("failed to load key %s: %w", keyName, err)
+				}
+				signer, err = evm.NewSignerFromPrivateKey(sk.PrivKeyHex())
+				if err != nil {
+					return err
+				}
+				ux.Logger.PrintToUser("Using key '%s' EVM address for complete operation. Ensure it has L1 gas tokens.", keyName)
+			}
+		}
+		if signer == nil {
+			return fmt.Errorf("failed to obtain signer for complete validator registration: no valid key material found")
+		}
+	} else if pos {
 		// For PoS mode, check if external signing is requested (for multi-sig staker/owner)
 		if externalValidatorManagerOwner {
 			// Multi-sig staker scenario: use NoOpSigner to generate calldata
@@ -789,7 +834,9 @@ func CallAddValidator(
 	}
 	initValidatorRegistrationOpts := validatormanager.InitValidatorRegistrationOptions{
 		// Execution behavior (don't broadcast; return unsigned init tx)
-		BuildOnly: externalValidatorManagerOwner,
+		// When initiateTxHash is provided, the initiate step is already done,
+		// so the complete step (permissionless) should be sent automatically
+		BuildOnly: externalValidatorManagerOwner && initiateTxHash == "",
 		Logger:    duallogger.NewDualLogger(true, app),
 	}
 
@@ -838,9 +885,14 @@ func CallAddValidator(
 		return fmt.Errorf("failure connecting to validator manager L1: %w", err)
 	}
 	// SetupProposerVM requires sending a transaction to advance the block timestamp.
-	// For external signing (multi-sig), we try to use genesis key if available,
-	// otherwise skip and let the user handle it manually.
-	if externalValidatorManagerOwner {
+	// When initiateTxHash is provided and we have a signer from --key, use it directly.
+	// For external signing (multi-sig) without initiateTxHash, try genesis key or skip.
+	if signer != nil && initiateTxHash != "" {
+		// We have a signer from --key and initiate is already done, use it for ProposerVM
+		if err := client.SetupProposerVM(signer); err != nil {
+			ux.Logger.PrintToUser("%s", logging.Yellow.Wrap("Warning: Could not advance block timestamp automatically. You may need to send a transaction to the L1 before completing registration."))
+		}
+	} else if externalValidatorManagerOwner || signer == nil {
 		// Try to use genesis key for SetupProposerVM
 		_, genesisPrivateKey, err := contract.GetEVMSubnetPrefundedKey(
 			app,
@@ -855,7 +907,7 @@ func CallAddValidator(
 				}
 			}
 		} else {
-			ux.Logger.PrintToUser("%s", logging.Yellow.Wrap("Warning: External signing mode - skipping automatic block timestamp advancement. Ensure a recent block exists on the L1."))
+			ux.Logger.PrintToUser("%s", logging.Yellow.Wrap("Warning: Skipping automatic block timestamp advancement. Ensure a recent block exists on the L1."))
 		}
 	} else {
 		if err := client.SetupProposerVM(signer); err != nil {
