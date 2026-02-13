@@ -505,6 +505,9 @@ func CallAddValidator(
 				ux.Logger.PrintToUser("Using key '%s' EVM address for complete operation. Ensure it has L1 gas tokens.", keyName)
 			}
 		}
+		if signer == nil {
+			return fmt.Errorf("failed to obtain signer for complete validator registration: no valid key material found")
+		}
 	} else if pos {
 		// For PoS mode, check if external signing is requested (for multi-sig staker/owner)
 		if externalValidatorManagerOwner {
